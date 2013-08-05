@@ -49,8 +49,9 @@ module Bluepill
       :group_start_noblock,
       :group_restart_noblock,
       :group_stop_noblock,
-      :group_unmonitor_noblock
+      :group_unmonitor_noblock,
 
+      :use_process_journal
     ]
 
     attr_accessor :name, :watches, :triggers, :logger, :skip_ticks_until, :process_running
@@ -137,6 +138,7 @@ module Bluepill
       @environment = {}
       @on_start_timeout = "start"
       @group_start_noblock = @group_stop_noblock = @group_restart_noblock = @group_unmonitor_noblock = true
+      @use_process_journal = true
 
       CONFIGURABLE_ATTRIBUTES.each do |attribute_name|
         self.send("#{attribute_name}=", options[attribute_name]) if options.has_key?(attribute_name)
@@ -276,12 +278,27 @@ module Bluepill
     end
 
     def start_process
-      ProcessJournal.kill_all_from_journal(name) # be sure nothing else is running from previous runs
+      if use_process_journal?
+        ProcessJournal.kill_all_from_journal(name) # be sure nothing else is running from previous runs
+      else
+        logger.debug "Not using process journal when starting #{name}"
+
+        filename = ProcessJournal.pid_journal_filename(name)
+        if File.exists?(filename)
+          logger.warning "Stale pid journal still present at #{filename}"
+        end
+
+        filename = ProcessJournal.pgid_journal_filename(name)
+        if File.exists?(filename)
+          logger.warning "Stale pgid journal still present at #{filename}"
+        end
+      end
+
       pre_start_process
       logger.warning "Executing start command: #{start_command}"
       if self.daemonize?
         daemon_id = System.daemonize(start_command, self.system_command_options)
-        if daemon_id
+        if use_process_journal? && daemon_id
           ProcessJournal.append_pid_to_journal(name, daemon_id)
           children.each {|child|
             ProcessJournal.append_pid_to_journal(name, child.actual_id)
@@ -314,7 +331,7 @@ module Bluepill
     end
 
     def stop_process
-      if monitor_children
+      if use_process_journal? && monitor_children
         System.get_children(self.actual_pid).each do |child_pid|
           ProcessJournal.append_pid_to_journal(name, child_pid)
         end
@@ -361,7 +378,11 @@ module Bluepill
         logger.warning "Executing default stop command. Sending TERM signal to #{actual_pid}"
         signal_process("TERM")
       end
-      ProcessJournal.kill_all_from_journal(name) # finish cleanup
+      if use_process_journal?
+        ProcessJournal.kill_all_from_journal(name) # finish cleanup
+      else
+        logger.debug "Not using process journal when stopping #{name}"
+      end
       self.unlink_pid # TODO: we only write the pid file if we daemonize, should we only unlink it if we daemonize?
 
       self.skip_ticks_for(stop_grace_time)
@@ -403,6 +424,10 @@ module Bluepill
       !!self.monitor_children
     end
 
+    def use_process_journal?
+      !!self.use_process_journal
+    end
+
     def signal_process(code)
       code = code.to_s.upcase if code.is_a?(String) || code.is_a?(Symbol)
       ::Process.kill(code, actual_pid)
@@ -441,7 +466,9 @@ module Bluepill
     end
 
     def actual_pid=(pid)
-      ProcessJournal.append_pid_to_journal(name, pid) # be sure to always log the pid
+      if use_process_journal?
+        ProcessJournal.append_pid_to_journal(name, pid) # be sure to always log the pid
+      end
       @actual_pid = pid
     end
 
@@ -477,7 +504,9 @@ module Bluepill
 
       # Construct a new process wrapper for each new found children
       new_children_pids.each do |child_pid|
-        ProcessJournal.append_pid_to_journal(name, child_pid)
+        if use_process_journal?
+          ProcessJournal.append_pid_to_journal(name, child_pid)
+        end
         child_name = "<child(pid:#{child_pid})>"
         logger = self.logger.prefix_with(child_name)
 
